@@ -1,3 +1,5 @@
+![Banner](banner.png)
+
 # file-timeline-generator
 Generates a timeline of file modifications, accesses, and metadata changes based on filesystem events (inotify or similar). Outputs a CSV for analysis. - Focused on File operations and analysis
 
