@@ -5,8 +5,12 @@ import sys
 import time
 from pathlib import Path
 import csv
-import inotify.adapters
-import inotify.constants
+try:
+    import inotify.adapters
+    import inotify.constants
+except ImportError:
+    logging.error("Missing required library: inotify. Install it with: pip install -r requirements.txt")
+    sys.exit(1)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -82,15 +86,22 @@ def monitor_directory(target_directory, output_file, recursive, event_mask):
         event_mask (int): The inotify event mask.
     """
 
+    row_count = 0
     try:
         i = inotify.adapters.Inotify()
 
-        if recursive:
-            watch_flags = inotify.constants.IN_RECURSIVE | event_mask
-        else:
-            watch_flags = event_mask
+        watch_flags = event_mask
 
-        i.add_watch(target_directory, watch_flags)
+        watched = []
+        if recursive:
+            # inotify has no recursive flag: walk the tree and add one
+            # watch per directory.
+            for root, dirs, files in os.walk(target_directory):
+                i.add_watch(root, watch_flags)
+                watched.append(root)
+        else:
+            i.add_watch(target_directory, watch_flags)
+            watched.append(target_directory)
 
         logging.info(f"Monitoring directory: {target_directory}")
         logging.info(f"Outputting to: {output_file}")
@@ -100,6 +111,27 @@ def monitor_directory(target_directory, output_file, recursive, event_mask):
             csv_writer = csv.writer(csvfile)
             csv_writer.writerow(["Timestamp", "Event", "Path", "Filename"])  # Write header
 
+            # Seed the timeline with the files already present, one row
+            # per file in the watched scope, using each file's
+            # modification time. The Event column carries the plain
+            # marker "existing" for these rows.
+            if recursive:
+                seed_paths = []
+                for root, dirs, files in os.walk(target_directory):
+                    for fname in files:
+                        seed_paths.append(Path(root) / fname)
+            else:
+                seed_paths = [p for p in Path(target_directory).iterdir() if p.is_file()]
+            for seed in seed_paths:
+                try:
+                    mtime = seed.stat().st_mtime
+                except OSError:
+                    continue
+                ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime))
+                csv_writer.writerow([ts, "existing", str(seed.parent), seed.name])
+                row_count += 1
+            csvfile.flush()
+
             try:
                 for event in i.event_gen(yield_nones=False):
                     (ok, watch_mask, cookie, name) = event
@@ -108,7 +140,7 @@ def monitor_directory(target_directory, output_file, recursive, event_mask):
                         logging.error("Inotify error occurred")
                         break  # Exit the loop if there's an error.
 
-                    event_names = [name for mask_name in dir(inotify.constants)
+                    event_names = [mask_name for mask_name in dir(inotify.constants)
                                    if mask_name.startswith('IN_') and getattr(inotify.constants, mask_name) & watch_mask]
 
                     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -116,6 +148,7 @@ def monitor_directory(target_directory, output_file, recursive, event_mask):
                     file_path = Path(target_directory) / name if name else Path(target_directory)
 
                     csv_writer.writerow([timestamp, event_string, str(file_path.parent), name])
+                    row_count += 1
                     csvfile.flush()  # Ensure data is written to disk immediately
 
                     logging.debug(f"Event: Timestamp={timestamp}, Event(s)={event_string}, Path={file_path.parent}, Filename={name}")
@@ -128,7 +161,13 @@ def monitor_directory(target_directory, output_file, recursive, event_mask):
                 i.remove_watch(target_directory)
                 logging.info(f"Stopped monitoring {target_directory}")
 
+        if row_count == 0:
+            logging.error("No events recorded.")
+            sys.exit(1)
+        logging.info(f"Recorded {row_count} row(s) in {output_file}")
 
+    except SystemExit:
+        raise
     except Exception as e:
         logging.error(f"Failed to start monitoring: {e}", exc_info=True)
         sys.exit(1)
