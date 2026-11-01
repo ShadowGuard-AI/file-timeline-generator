@@ -107,6 +107,10 @@ def monitor_directory(target_directory, output_file, recursive, event_mask):
         logging.info(f"Outputting to: {output_file}")
         logging.info(f"Recursive: {recursive}")
 
+        # If the output file lands inside the watched directory, the watcher
+        # watches its own writing: each flushed row can raise the very events
+        # the loop is recording. The default output name in the working
+        # directory makes that a realistic way to run this tool, not a corner.
         with open(output_file, 'w', newline='') as csvfile:
             csv_writer = csv.writer(csvfile)
             csv_writer.writerow(["Timestamp", "Event", "Path", "Filename"])  # Write header
@@ -140,11 +144,21 @@ def monitor_directory(target_directory, output_file, recursive, event_mask):
                         logging.error("Inotify error occurred")
                         break  # Exit the loop if there's an error.
 
+                    # Event names are rebuilt by testing every IN_ constant against the
+                    # delivered mask, including composite constants such as IN_ALL_EVENTS.
+                    # The Event column therefore lists every mask that overlaps, not just
+                    # the single event that fired, and it reads wider than the truth.
                     event_names = [mask_name for mask_name in dir(inotify.constants)
                                    if mask_name.startswith('IN_') and getattr(inotify.constants, mask_name) & watch_mask]
 
                     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
                     event_string = ", ".join(event_names)
+                    # The watch descriptor in the event is ignored, so an event from a
+                    # watched subdirectory is reported as if it happened in the target
+                    # directory itself. In recursive mode the Path column is wrong for
+                    # every event below the top level; the filename is right, the folder
+                    # is the root. New subdirectories created after startup are also never
+                    # watched, because watches are added once, in the walk above.
                     file_path = Path(target_directory) / name if name else Path(target_directory)
 
                     csv_writer.writerow([timestamp, event_string, str(file_path.parent), name])
@@ -161,6 +175,8 @@ def monitor_directory(target_directory, output_file, recursive, event_mask):
                 i.remove_watch(target_directory)
                 logging.info(f"Stopped monitoring {target_directory}")
 
+        # Zero rows exits 1, but the header was already written to the output
+        # file, so a failed run still leaves a valid looking CSV shell behind.
         if row_count == 0:
             logging.error("No events recorded.")
             sys.exit(1)
@@ -191,6 +207,11 @@ def main():
         # Parse events
         try:
             event_constants = parse_events(args.events)
+            # The mask is summed, not OR-ed. Distinct inotify flags are separate
+            # powers of two, so a sum of distinct constants equals their OR. A
+            # duplicated event name breaks that: it adds the same power twice,
+            # which carries into the next bit and silently watches for a
+            # different event than the one asked for.
             event_mask = sum(event_constants)
         except ValueError as e:
             logging.error(e)
